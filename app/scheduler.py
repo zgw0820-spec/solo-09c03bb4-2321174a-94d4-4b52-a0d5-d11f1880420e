@@ -15,6 +15,15 @@ Design invariants
 * Any single tile whose PPM exceeds the quota limit, or any conversion
   failure, fails the whole batch: the tile name is reported, the batch's
   staged bytes and partial tar are cleaned up, and other batches continue.
+* Converter processes are supervised. Each worker owns a private task queue,
+  so the scheduler always knows which tile (if any) dies with a process.
+  If a worker exits unexpectedly, only batches whose conversion results were
+  lost with it fail — the lost tile is named. Results the worker handed back
+  before exiting are processed normally, and a task it never picked up is
+  reclaimed and re-dispatched rather than failed. A fresh worker is spawned
+  to restore the configured pool size; surviving workers are kept. A failed
+  batch's quota is handed back per tile only once that tile can no longer be
+  written to staging and its staged bytes have been removed.
 """
 from __future__ import annotations
 
@@ -46,6 +55,9 @@ QUEUED = "queued"    # waiting for a free active slot
 PACKING = "packing"  # active: converting / packing
 DONE = "done"        # tar complete, downloadable
 FAILED = "failed"    # aborted, staging cleaned
+
+_WATCHDOG_INTERVAL_S = 0.2  # how often worker processes are checked for exits
+_LOSS_GRACE_S = 1.0         # wait for an in-transit result before declaring a loss
 
 
 @dataclass
@@ -79,6 +91,24 @@ class Batch:
         return sum(t.reserved for t in self.tiles)
 
 
+@dataclass
+class _Worker:
+    """One supervised converter process with its own task queue.
+
+    A dedicated queue per worker (instead of one shared queue) is what lets
+    the scheduler know exactly which tile — if any — is lost when the
+    process exits unexpectedly. ``started`` is set once the worker signals
+    it picked the task up; without that signal a dead worker never touched
+    the task, so it can simply be re-dispatched instead of failing a batch.
+    """
+
+    wid: int
+    proc: multiprocessing.Process
+    task_q: multiprocessing.Queue
+    current: tuple[str, int] | None = None  # (batch_id, tile index) in flight
+    started: bool = False                   # worker acked picking current up
+
+
 class Scheduler:
     """Owns all mutable scheduling state. Every mutating method runs on the
     API process's event loop, so no extra locking is needed beyond the
@@ -93,11 +123,14 @@ class Scheduler:
         self.active: list[Batch] = []        # batches currently packing (FIFO)
         self.waiting: deque[Batch] = deque()  # submitted but not yet active
         self.used = 0                         # staging bytes currently reserved
-        self.inflight = 0                     # conversions dispatched, not yet reported
-        self._task_q: multiprocessing.Queue | None = None
+        self.inflight = 0                     # conversions dispatched, not yet resolved
+        self._mp_ctx: multiprocessing.context.BaseContext | None = None
         self._result_q: multiprocessing.Queue | None = None
-        self._workers: list[multiprocessing.Process] = []
+        self._workers: list[_Worker] = []             # alive, dispatchable
+        self._workers_by_id: dict[int, _Worker] = {}  # incl. dead (late results)
+        self._next_wid = 0
         self._reader_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -116,34 +149,54 @@ class Scheduler:
             ctx = multiprocessing.get_context("fork")
         except ValueError:  # pragma: no cover - non-POSIX fallback
             ctx = multiprocessing.get_context("spawn")
-        self._task_q = ctx.Queue()
+        self._mp_ctx = ctx
         self._result_q = ctx.Queue()
-        for i in range(self.settings.workers):
-            p = ctx.Process(
-                target=run_worker,
-                args=(self._task_q, self._result_q),
-                name=f"ppm-worker-{i}",
-                daemon=True,
-            )
-            p.start()
-            self._workers.append(p)
+        for _ in range(self.settings.workers):
+            self._spawn_worker()
         self._reader_task = asyncio.create_task(self._result_reader())
+        self._watchdog_task = asyncio.create_task(self._worker_watchdog())
         log.info(
             "scheduler up: workers=%d staging_limit=%d bytes max_active_batches=%d data_dir=%s",
             self.settings.workers, self.settings.ppm_staging_bytes,
             self.settings.max_active_batches, self.settings.data_dir,
         )
 
+    def _spawn_worker(self) -> _Worker:
+        """Start one converter process and register it. Used both at startup
+        and to replenish the pool after an unexpected exit."""
+        wid = self._next_wid
+        self._next_wid += 1
+        task_q = self._mp_ctx.Queue()
+        proc = self._mp_ctx.Process(
+            target=run_worker,
+            args=(task_q, self._result_q, wid),
+            name=f"ppm-worker-{wid}",
+            daemon=True,
+        )
+        proc.start()
+        worker = _Worker(wid=wid, proc=proc, task_q=task_q)
+        self._workers.append(worker)
+        self._workers_by_id[wid] = worker
+        log.info(
+            "worker=%d pid=%d STARTED alive=%d/%d",
+            wid, proc.pid, len(self._workers), self.settings.workers,
+        )
+        return worker
+
     async def stop(self) -> None:
-        if self._reader_task:
-            self._reader_task.cancel()
-        if self._task_q:
-            for _ in self._workers:
-                self._task_q.put(None)
-        for p in self._workers:
-            p.join(timeout=3)
-            if p.is_alive():
-                p.terminate()
+        for task in (self._watchdog_task, self._reader_task):
+            if task:
+                task.cancel()
+        for w in self._workers:
+            try:
+                w.task_q.put(None)
+            except Exception:  # noqa: BLE001 - shutdown best effort
+                pass
+        for w in self._workers:
+            w.proc.join(timeout=3)
+            if w.proc.is_alive():
+                w.proc.terminate()
+        self._workers.clear()
 
     # ------------------------------------------------------------------
     # intake
@@ -176,16 +229,21 @@ class Scheduler:
     # dispatch (quota gate)
     # ------------------------------------------------------------------
     def _try_dispatch(self) -> None:
-        """Start conversions while workers are free and quota allows.
+        """Start conversions while workers are idle and quota allows.
 
         Batches are scanned oldest-first; each batch offers its next
         unstarted tile (strict in-order start per batch). A tile starts only
-        if its full PPM size fits in the remaining shared quota.
+        if its full PPM size fits in the remaining shared quota. Dispatch is
+        gated on idle workers rather than a counter, so a worker that died
+        mid-task can never wedge the pipeline.
         """
-        while self.inflight < self.settings.workers:
+        while True:
+            idle = [w for w in self._workers if w.current is None]
+            if not idle:
+                return
             progressed = False
             for batch in list(self.active):
-                if self.inflight >= self.settings.workers:
+                if not idle:
                     break
                 if batch.next_to_start >= len(batch.tiles):
                     continue
@@ -204,24 +262,30 @@ class Scheduler:
                     break
                 if self.used + tile.ppm_size > self.settings.ppm_staging_bytes:
                     continue  # quota blocked; give other batches a chance
-                self._dispatch(batch, tile)
+                self._dispatch(batch, tile, idle.pop())
                 progressed = True
             if not progressed:
                 return
 
-    def _dispatch(self, batch: Batch, tile: Tile) -> None:
+    def _dispatch(self, batch: Batch, tile: Tile, worker: _Worker) -> None:
         tile.state = CONVERTING
         tile.reserved = tile.ppm_size or 0
         batch.next_to_start += 1
         self.used += tile.reserved
-        self.inflight += 1
-        self._task_q.put((batch.id, tile.index, tile.name,
-                          str(tile.png_path), str(tile.ppm_path)))
+        self._assign(worker, batch, tile)
         log.info(
-            "batch=%s tile=%d name=%s DISPATCH reserve=%d used=%d/%d inflight=%d",
-            batch.id, tile.index, tile.name, tile.reserved,
+            "batch=%s tile=%d name=%s DISPATCH worker=%d reserve=%d used=%d/%d inflight=%d",
+            batch.id, tile.index, tile.name, worker.wid, tile.reserved,
             self.used, self.settings.ppm_staging_bytes, self.inflight,
         )
+
+    def _assign(self, worker: _Worker, batch: Batch, tile: Tile) -> None:
+        """Hand one tile to one specific worker (its quota is already reserved)."""
+        worker.current = (batch.id, tile.index)
+        worker.started = False
+        self.inflight += 1
+        worker.task_q.put((batch.id, tile.index, tile.name,
+                           str(tile.png_path), str(tile.ppm_path)))
 
     # ------------------------------------------------------------------
     # worker results
@@ -229,24 +293,51 @@ class Scheduler:
     async def _result_reader(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
-            result = await loop.run_in_executor(None, self._result_q.get)
+            msg = await loop.run_in_executor(None, self._result_q.get)
             try:
-                await self._on_result(result)
+                if msg[0] == "started":
+                    self._on_started(msg)
+                else:
+                    await self._on_result(msg)
             except Exception:  # pragma: no cover - defensive
-                log.exception("failed to handle worker result %r", result)
+                log.exception("failed to handle worker message %r", msg)
+
+    def _on_started(self, msg) -> None:
+        """A worker picked up its assigned task: from here on, its death
+        means the task's conversion result is lost."""
+        _, worker_id, batch_id, index = msg
+        worker = self._workers_by_id.get(worker_id)
+        if worker is not None and worker.current == (batch_id, index):
+            worker.started = True
 
     async def _on_result(self, result) -> None:
-        batch_id, index, name, size, error, duration = result
-        self.inflight -= 1
+        _, worker_id, batch_id, index, name, size, error, duration = result
+        worker = self._workers_by_id.get(worker_id)
+        if worker is not None and worker.current == (batch_id, index):
+            worker.current = None
+            self.inflight -= 1
+        else:
+            # The watchdog already resolved this task as lost; the result is
+            # late. It is still cleaned up below, but must not be counted twice.
+            log.warning(
+                "batch=%s tile=%d name=%s result from worker=%d has no live assignment",
+                batch_id, index, name, worker_id,
+            )
         batch = self.batches.get(batch_id)
         if batch is None or batch.state != PACKING:
             # Batch already failed while this tile was in flight: drop any
-            # file the worker just wrote; its quota was released at failure.
+            # file the worker just wrote. The worker has finished writing
+            # (that is what a result means), so the tile's quota can go back
+            # now if it was still reserved (worker-exit failures defer it).
             if batch is not None:
+                tile = batch.tiles[index]
                 try:
-                    batch.tiles[index].ppm_path.unlink(missing_ok=True)
+                    tile.ppm_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+                if tile.reserved:
+                    self.used -= tile.reserved
+                    tile.reserved = 0
             log.warning(
                 "batch=%s tile=%d name=%s result DISCARDED (batch state=%s)",
                 batch_id, index, name, batch.state if batch else "unknown",
@@ -309,20 +400,121 @@ class Scheduler:
             batch.tar = None
 
     # ------------------------------------------------------------------
+    # worker supervision
+    # ------------------------------------------------------------------
+    async def _worker_watchdog(self) -> None:
+        """Reap unexpectedly exited workers and repair the schedule."""
+        while True:
+            await asyncio.sleep(_WATCHDOG_INTERVAL_S)
+            for worker in list(self._workers):
+                if not worker.proc.is_alive():
+                    await self._on_worker_death(worker)
+
+    async def _on_worker_death(self, worker: _Worker) -> None:
+        if worker not in self._workers:
+            return  # already handled
+        self._workers.remove(worker)
+        worker.proc.join()  # reap: the process can no longer write to staging
+        exitcode = worker.proc.exitcode
+        lost = worker.current
+        log.error(
+            "worker=%d pid=%d EXITED unexpectedly exitcode=%s in_flight=%s",
+            worker.wid, worker.proc.pid, exitcode, lost,
+        )
+        # Restore the configured worker count first; surviving workers are
+        # kept as they are. Capacity is back even while the lost tile (if
+        # any) is still being resolved below.
+        self._spawn_worker()
+        self._try_dispatch()
+        if lost is None:
+            return  # the worker was idle: nothing was lost, nobody fails
+        batch_id, index = lost
+        # Messages the worker sent just before exiting (its pickup ack or its
+        # result) may still be in transit; give the reader a grace window to
+        # deliver them — a result that arrives is processed normally.
+        deadline = asyncio.get_running_loop().time() + _LOSS_GRACE_S
+        while worker.current is not None:
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.02)
+        try:
+            worker.task_q.close()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        if worker.current is None:
+            log.info(
+                "worker=%d result for batch=%s tile=%d arrived before loss was declared",
+                worker.wid, batch_id, index,
+            )
+            self._try_dispatch()
+            return
+        started = worker.started
+        worker.current = None
+        self.inflight -= 1  # the dead worker's assignment is resolved here
+        batch = self.batches.get(batch_id)
+        tile = batch.tiles[index] if batch is not None and index < len(batch.tiles) else None
+        if (not started and batch is not None and tile is not None
+                and batch.state == PACKING):
+            # The dead worker never picked this task up: hand it to a live
+            # worker. The tile's quota stayed reserved the whole time.
+            idle = next((w for w in self._workers if w.current is None), None)
+            if idle is not None:
+                self._assign(idle, batch, tile)  # re-counts the moved task
+                log.warning(
+                    "batch=%s tile=%d name=%s REDISPATCHED to worker=%d: "
+                    "worker=%d died before starting it",
+                    batch.id, index, tile.name, idle.wid, worker.wid,
+                )
+                self._try_dispatch()
+                return
+            log.error("batch=%s tile=%d no live worker for redispatch", batch.id, index)
+        # The process has been reaped, so the tile can no longer be written
+        # to staging: remove the partial PPM remnant first, and only then
+        # hand the tile's quota back.
+        if tile is not None:
+            try:
+                tile.ppm_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if tile.reserved:
+                self.used -= tile.reserved
+                log.error(
+                    "batch=%s tile=%d name=%s LOST remnant removed, released=%d used=%d/%d",
+                    batch_id, index, tile.name, tile.reserved,
+                    self.used, self.settings.ppm_staging_bytes,
+                )
+                tile.reserved = 0
+        if batch is not None and tile is not None and batch.state == PACKING:
+            self._fail_batch(
+                batch, tile,
+                f"conversion worker exited unexpectedly (exitcode={exitcode}); "
+                "the tile's conversion result was lost",
+                deferred_release=True,
+            )
+        self._try_dispatch()
+
+    # ------------------------------------------------------------------
     # failure handling
     # ------------------------------------------------------------------
-    def _fail_batch(self, batch: Batch, tile: Tile, error: str) -> None:
+    def _fail_batch(self, batch: Batch, tile: Tile, error: str, *,
+                    deferred_release: bool = False) -> None:
         batch.state = FAILED
         batch.failed_tile = tile.name
         batch.error = error
         released = 0
         for t in batch.tiles:
-            if t.reserved:
+            if t.state in (PENDING, CONVERTING, CONVERTED):
+                t.state = ABORTED
+            if t.reserved and not deferred_release:
                 released += t.reserved
                 self.used -= t.reserved
                 t.reserved = 0
-            if t.state in (PENDING, CONVERTING, CONVERTED):
-                t.state = ABORTED
+            # With deferred_release (worker-exit failures) each tile's quota
+            # goes back only once the tile can no longer be written to
+            # staging and its staged bytes are gone: staged tiles are
+            # released by _cleanup_failed after unlinking, in-flight tiles
+            # when their late result is discarded or their worker's own
+            # exit is handled.
         if batch in self.active:
             self.active.remove(batch)
         else:
@@ -331,8 +523,8 @@ class Scheduler:
             except ValueError:
                 pass
         log.error(
-            "batch=%s FAILED tile=%s error=%r released=%d used=%d/%d",
-            batch.id, tile.name, error, released,
+            "batch=%s FAILED tile=%s error=%r released=%d deferred=%s used=%d/%d",
+            batch.id, tile.name, error, released, deferred_release,
             self.used, self.settings.ppm_staging_bytes,
         )
         # File cleanup runs under the pack lock: a tar append for this batch
@@ -341,21 +533,42 @@ class Scheduler:
         self._activate()
 
     async def _cleanup_failed(self, batch: Batch) -> None:
-        """Remove the failed batch's staged PPMs and partial tar."""
+        """Remove the failed batch's staged PPMs and partial tar.
+
+        Tiles still being converted by a live worker are left alone: their
+        file and quota are released when the late result is discarded (or
+        when that worker's own exit is handled).
+        """
         try:
             async with batch.pack_lock:
                 if batch.tar is not None:
                     batch.tar.close()
                     batch.tar = None
                 batch.tar_path.unlink(missing_ok=True)
+                released = 0
                 for t in batch.tiles:
+                    if t.reserved and self._in_flight(batch.id, t.index):
+                        continue  # a live worker may still be writing this file
                     try:
                         t.ppm_path.unlink(missing_ok=True)
                     except OSError:
                         pass
+                    if t.reserved:
+                        self.used -= t.reserved
+                        released += t.reserved
+                        t.reserved = 0
                 shutil.rmtree(self.stage_dir / batch.id, ignore_errors=True)
+                if released:
+                    log.info(
+                        "batch=%s CLEANUP released=%d used=%d/%d",
+                        batch.id, released, self.used, self.settings.ppm_staging_bytes,
+                    )
         except Exception:  # pragma: no cover - defensive
             log.exception("batch=%s cleanup failed", batch.id)
+        self._try_dispatch()  # freed quota may unblock waiting tiles
+
+    def _in_flight(self, batch_id: str, index: int) -> bool:
+        return any(w.current == (batch_id, index) for w in self._workers)
 
     # ------------------------------------------------------------------
     # introspection for the API
@@ -365,6 +578,19 @@ class Scheduler:
             "ppm_staging_limit_bytes": self.settings.ppm_staging_bytes,
             "ppm_staging_used_bytes": self.used,
             "workers": self.settings.workers,
+            "workers_alive": len(self._workers),
+            "worker_processes": [
+                {
+                    "worker_id": w.wid,
+                    "pid": w.proc.pid,
+                    "busy": w.current is not None,
+                    "current": (
+                        {"batch_id": w.current[0], "tile_index": w.current[1]}
+                        if w.current is not None else None
+                    ),
+                }
+                for w in self._workers
+            ],
             "conversions_in_flight": self.inflight,
             "active_batches": [b.id for b in self.active],
             "queued_batches": [b.id for b in self.waiting],
